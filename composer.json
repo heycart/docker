@@ -4,7 +4,12 @@
   "license": "MIT",
   "description": "Docker image for HeyCart 6 production",
   "require": {
-    "heycart/core": ">=6.7.0.0",
+    "heycart/core": ">=6.7.2.0",
     "heycart/deployment-helper": "*"
+  },
+  "config": {
+    "allow-plugins": {
+      "symfony/runtime": true
+    }
   }
 }
