@@ -1,0 +1,499 @@
+name: Build
+on:
+  workflow_dispatch:
+  push:
+    branches:
+      - main
+  pull_request:
+  schedule:
+    - cron: '10 4 * * *'
+
+concurrency:
+  group: "${{ github.ref }}"
+  cancel-in-progress: true
+
+env:
+  DOCKER_BUILDKIT: 1
+  COSIGN_EXPERIMENTAL: 1
+
+permissions:
+  contents: write
+  id-token: write
+  packages: write
+  pull-requests: write
+
+jobs:
+  generate-matrix:
+    runs-on: ubuntu-24.04
+    outputs:
+      matrix: ${{ steps.generate-matrix.outputs.matrix }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Generate Matrix
+        id: generate-matrix
+        run: |
+          MATRIX=$(php matrix.php)
+          echo "matrix<<EOF" >> $GITHUB_OUTPUT
+          echo "$MATRIX" >> $GITHUB_OUTPUT
+          echo 'EOF' >> $GITHUB_OUTPUT
+
+  frankenphp-amd64:
+    name: FrankenPHP (amd64)
+    runs-on: ubuntu-24.04
+
+    needs: [generate-matrix]
+    strategy: ${{ fromJson(needs.generate-matrix.outputs.matrix) }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Login into Docker Hub
+        if: github.ref == 'refs/heads/main'
+        run: echo "${{ secrets.DOCKER_HUB_PASSWORD }}" | docker login -u ${{ secrets.DOCKER_HUB_USERNAME }} --password-stdin
+
+      - name: Login into Github Docker Registery
+        run: echo "${{ secrets.GITHUB_TOKEN }}" | docker login ghcr.io -u ${{ github.actor }} --password-stdin
+
+      - name: Build and Push
+        if: matrix.php != '8.1'
+        uses: docker/build-push-action@v6
+        with:
+          tags: |
+            ${{ matrix.frankenphp-tags-amd64 }}
+          context: frankenphp
+          cache-from: type=gha,scope=frankenphp-${{ matrix.php }}-amd64
+          cache-to: type=gha,mode=max,scope=frankenphp-${{ matrix.php }}-amd64
+          platforms: linux/amd64
+          build-args: |
+            PHP_VERSION=${{ matrix.php }}
+            PHP_PATCH_VERSION=${{ matrix.phpPatch }}
+            PHP_DIGEST=${{ matrix.phpPatchDigest }}
+            REDIS_PHP_MODULE=${{ matrix.redisPHPModule }}
+          push: true
+          provenance: false
+
+  frankenphp-arm64:
+    name: FrankenPHP (arm64)
+    runs-on: ubuntu-24.04-arm
+
+    needs: [generate-matrix]
+    strategy: ${{ fromJson(needs.generate-matrix.outputs.matrix) }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Login into Docker Hub
+        if: github.ref == 'refs/heads/main'
+        run: echo "${{ secrets.DOCKER_HUB_PASSWORD }}" | docker login -u ${{ secrets.DOCKER_HUB_USERNAME }} --password-stdin
+
+      - name: Login into Github Docker Registery
+        run: echo "${{ secrets.GITHUB_TOKEN }}" | docker login ghcr.io -u ${{ github.actor }} --password-stdin
+
+      - name: Build and Push
+        if: matrix.php != '8.1'
+        uses: docker/build-push-action@v6
+        with:
+          tags: |
+            ${{ matrix.frankenphp-tags-arm64 }}
+          context: frankenphp
+          cache-from: type=gha,scope=frankenphp-${{ matrix.php }}-arm64
+          cache-to: type=gha,mode=max,scope=frankenphp-${{ matrix.php }}-arm64
+          platforms: linux/arm64
+          build-args: |
+            PHP_VERSION=${{ matrix.php }}
+            PHP_PATCH_VERSION=${{ matrix.phpPatch }}
+            PHP_DIGEST=${{ matrix.phpPatchDigest }}
+            REDIS_PHP_MODULE=${{ matrix.redisPHPModule }}
+          push: true
+          provenance: false
+
+  frankenphp:
+    name: FrankenPHP merge manifest
+    runs-on: ubuntu-24.04
+
+    strategy: ${{ fromJson(needs.generate-matrix.outputs.matrix) }}
+    needs: [generate-matrix, frankenphp-amd64, frankenphp-arm64]
+    steps:
+      - name: Login into Docker Hub
+        if: github.ref == 'refs/heads/main'
+        run: echo "${{ secrets.DOCKER_HUB_PASSWORD }}" | docker login -u ${{ secrets.DOCKER_HUB_USERNAME }} --password-stdin
+
+      - name: Login into Github Docker Registery
+        run: echo "${{ secrets.GITHUB_TOKEN }}" | docker login ghcr.io -u ${{ github.actor }} --password-stdin
+
+      - name: Merge manifest
+        if: matrix.php != '8.1'
+        run: |
+          ${{ matrix.frankenphp-merge }}
+
+  frankenphp-otel:
+    name: FrankenPHP OTEL
+    runs-on: ubuntu-24.04
+    needs: [generate-matrix, frankenphp]
+    strategy: ${{ fromJson(needs.generate-matrix.outputs.matrix) }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Set up QEMU
+        uses: docker/setup-qemu-action@v3
+
+      - name: Login into Docker Hub
+        if: github.ref == 'refs/heads/main'
+        run: echo "${{ secrets.DOCKER_HUB_PASSWORD }}" | docker login -u ${{ secrets.DOCKER_HUB_USERNAME }} --password-stdin
+
+      - name: Login into Github Docker Registery
+        run: echo "${{ secrets.GITHUB_TOKEN }}" | docker login ghcr.io -u ${{ github.actor }} --password-stdin
+    
+      - name: Build and Push
+        if: matrix.php != '8.1'
+        uses: docker/build-push-action@v6
+        with:
+          tags: |
+            ${{ matrix.frankenphp-tags-otel }}
+          context: frankenphp-otel
+          platforms: linux/amd64,linux/arm64
+          cache-from: type=gha,scope=frankenphp-otel-${{ matrix.php }}
+          cache-to: type=gha,mode=max,scope=frankenphp-otel-${{ matrix.php }}
+          build-args: |
+            FRANKENPHP_IMAGE=${{ matrix.frankenphp-image }}
+          push: true
+          provenance: false
+
+  fpm-amd64:
+    name: PHP FPM ${{ matrix.php }} (amd64)
+    runs-on: ubuntu-24.04
+    needs: [generate-matrix]
+    strategy: ${{ fromJson(needs.generate-matrix.outputs.matrix) }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Login into Docker Hub
+        if: github.ref == 'refs/heads/main'
+        run: echo "${{ secrets.DOCKER_HUB_PASSWORD }}" | docker login -u ${{ secrets.DOCKER_HUB_USERNAME }} --password-stdin
+
+      - name: Login into Github Docker Registery
+        run: echo "${{ secrets.GITHUB_TOKEN }}" | docker login ghcr.io -u ${{ github.actor }} --password-stdin
+
+      - name: Build and Push
+        uses: docker/build-push-action@v6
+        with:
+          tags: |
+            ${{ matrix.fpm-tags-amd64 }}
+          context: fpm
+          cache-from: type=gha,scope=fpm-${{ matrix.php }}-amd64
+          cache-to: type=gha,mode=max,scope=fpm-${{ matrix.php }}-amd64
+          platforms: linux/amd64
+          build-args: |
+            PHP_PATCH_VERSION=${{ matrix.phpPatch }}
+            PHP_DIGEST=${{ matrix.phpPatchDigest }}
+            REDIS_PHP_MODULE=${{ matrix.redisPHPModule }}
+          push: true
+          provenance: false
+
+  fpm-arm64:
+    name: PHP FPM ${{ matrix.php }} (arm64)
+    runs-on: ubuntu-24.04-arm
+    needs: [generate-matrix]
+    strategy: ${{ fromJson(needs.generate-matrix.outputs.matrix) }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Login into Docker Hub
+        if: github.ref == 'refs/heads/main'
+        run: echo "${{ secrets.DOCKER_HUB_PASSWORD }}" | docker login -u ${{ secrets.DOCKER_HUB_USERNAME }} --password-stdin
+
+      - name: Login into Github Docker Registery
+        run: echo "${{ secrets.GITHUB_TOKEN }}" | docker login ghcr.io -u ${{ github.actor }} --password-stdin
+
+      - name: Build and Push
+        uses: docker/build-push-action@v6
+        with:
+          tags: |
+            ${{ matrix.fpm-tags-arm64 }}
+          context: fpm
+          cache-from: type=gha,scope=fpm-${{ matrix.php }}-arm64
+          cache-to: type=gha,mode=max,scope=fpm-${{ matrix.php }}-arm64
+          platforms: linux/arm64
+          build-args: |
+            PHP_PATCH_VERSION=${{ matrix.phpPatch }}
+            PHP_DIGEST=${{ matrix.phpPatchDigest }}
+            REDIS_PHP_MODULE=${{ matrix.redisPHPModule }}
+          push: true
+          provenance: false
+
+  fpm:
+    name: PHP FPM ${{ matrix.php }} merge manifest
+    runs-on: ubuntu-24.04
+    needs: [generate-matrix, fpm-amd64, fpm-arm64]
+    strategy: ${{ fromJson(needs.generate-matrix.outputs.matrix) }}
+    steps:
+      - name: Login into Docker Hub
+        if: github.ref == 'refs/heads/main'
+        run: echo "${{ secrets.DOCKER_HUB_PASSWORD }}" | docker login -u ${{ secrets.DOCKER_HUB_USERNAME }} --password-stdin
+
+      - name: Login into Github Docker Registery
+        run: echo "${{ secrets.GITHUB_TOKEN }}" | docker login ghcr.io -u ${{ github.actor }} --password-stdin
+
+      - name: Merge manifest
+        run: |
+          ${{ matrix.fpm-merge }}
+
+  fpm-otel:
+    name: PHP FPM ${{ matrix.php }} with OpenTelemetry
+    runs-on: ubuntu-24.04
+    needs: [generate-matrix, fpm]
+    strategy: ${{ fromJson(needs.generate-matrix.outputs.matrix) }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Set up QEMU
+        uses: docker/setup-qemu-action@v3
+
+      - name: Login into Docker Hub
+        if: github.ref == 'refs/heads/main'
+        run: echo "${{ secrets.DOCKER_HUB_PASSWORD }}" | docker login -u ${{ secrets.DOCKER_HUB_USERNAME }} --password-stdin
+
+      - name: Login into Github Docker Registery
+        run: echo "${{ secrets.GITHUB_TOKEN }}" | docker login ghcr.io -u ${{ github.actor }} --password-stdin
+    
+      - name: Build and Push
+        uses: docker/build-push-action@v6
+        with:
+          tags: |
+            ${{ matrix.fpm-tags-otel }}
+          context: fpm-otel
+          platforms: linux/amd64,linux/arm64
+          cache-from: type=gha,scope=fpm-otel-${{ matrix.php }}
+          cache-to: type=gha,mode=max,scope=fpm-otel-${{ matrix.php }}
+          build-args: |
+            FPM_IMAGE=${{ matrix.fpm-image }}
+          push: true
+          provenance: false
+
+  caddy:
+    name: Build Caddy with ${{ matrix.php }}
+    runs-on: ubuntu-24.04
+    needs: [generate-matrix, fpm]
+    strategy: ${{ fromJson(needs.generate-matrix.outputs.matrix) }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Set up QEMU
+        uses: docker/setup-qemu-action@v3
+
+      - name: Login into Docker Hub
+        if: github.ref == 'refs/heads/main'
+        run: echo "${{ secrets.DOCKER_HUB_PASSWORD }}" | docker login -u ${{ secrets.DOCKER_HUB_USERNAME }} --password-stdin
+
+      - name: Login into Github Docker Registery
+        run: echo "${{ secrets.GITHUB_TOKEN }}" | docker login ghcr.io -u ${{ github.actor }} --password-stdin
+
+      - name: Build and Push
+        uses: docker/build-push-action@v6
+        with:
+          tags: |
+            ${{ matrix.caddy-tags }}
+          context: caddy
+          cache-from: type=registry,ref=ghcr.io/heycart/docker-cache:${{ matrix.php }}-caddy
+          cache-to: type=registry,ref=ghcr.io/heycart/docker-cache:${{ matrix.php }}-caddy,mode=max
+          platforms: linux/amd64,linux/arm64
+          build-args: |
+            FPM_IMAGE=${{ matrix.fpm-image }}
+          push: true
+          provenance: false
+
+  caddy-otel:
+    name: Build Caddy ${{ matrix.php }} with OpenTelemetry
+    runs-on: ubuntu-24.04
+    needs: [generate-matrix, fpm-otel]
+    strategy: ${{ fromJson(needs.generate-matrix.outputs.matrix) }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Set up QEMU
+        uses: docker/setup-qemu-action@v3
+
+      - name: Login into Docker Hub
+        if: github.ref == 'refs/heads/main'
+        run: echo "${{ secrets.DOCKER_HUB_PASSWORD }}" | docker login -u ${{ secrets.DOCKER_HUB_USERNAME }} --password-stdin
+
+      - name: Login into Github Docker Registery
+        run: echo "${{ secrets.GITHUB_TOKEN }}" | docker login ghcr.io -u ${{ github.actor }} --password-stdin
+
+      - name: Build and Push
+        uses: docker/build-push-action@v6
+        with:
+          tags: |
+            ${{ matrix.caddy-tags-otel }}
+          context: caddy
+          platforms: linux/amd64,linux/arm64
+          build-args: |
+            FPM_IMAGE=${{ matrix.fpm-image }}-otel
+          push: true
+          provenance: false
+
+  nginx:
+    name: Build Nginx with ${{ matrix.php }}
+    runs-on: ubuntu-24.04
+    needs: [generate-matrix, fpm]
+    strategy: ${{ fromJson(needs.generate-matrix.outputs.matrix) }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Set up QEMU
+        uses: docker/setup-qemu-action@v3
+
+      - name: Login into Docker Hub
+        if: github.ref == 'refs/heads/main'
+        run: echo "${{ secrets.DOCKER_HUB_PASSWORD }}" | docker login -u ${{ secrets.DOCKER_HUB_USERNAME }} --password-stdin
+
+      - name: Login into Github Docker Registery
+        run: echo "${{ secrets.GITHUB_TOKEN }}" | docker login ghcr.io -u ${{ github.actor }} --password-stdin
+
+      - name: Build and Push
+        uses: docker/build-push-action@v6
+        with:
+          tags: |
+            ${{ matrix.nginx-tags }}
+          context: nginx
+          cache-from: type=registry,ref=ghcr.io/heycart/docker-cache:${{ matrix.php }}-nginx
+          cache-to: type=registry,ref=ghcr.io/heycart/docker-cache:${{ matrix.php }}-nginx,mode=max
+          platforms: linux/amd64,linux/arm64
+          build-args: |
+            FPM_IMAGE=${{ matrix.fpm-image }}
+          push: true
+          provenance: false
+
+  nginx-otel:
+    name: Build Nginx with ${{ matrix.php }} with OpenTelemetry
+    runs-on: ubuntu-24.04
+    needs: [generate-matrix, fpm-otel]
+    strategy: ${{ fromJson(needs.generate-matrix.outputs.matrix) }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Set up QEMU
+        uses: docker/setup-qemu-action@v3
+
+      - name: Login into Docker Hub
+        if: github.ref == 'refs/heads/main'
+        run: echo "${{ secrets.DOCKER_HUB_PASSWORD }}" | docker login -u ${{ secrets.DOCKER_HUB_USERNAME }} --password-stdin
+
+      - name: Login into Github Docker Registery
+        run: echo "${{ secrets.GITHUB_TOKEN }}" | docker login ghcr.io -u ${{ github.actor }} --password-stdin
+
+      - name: Build and Push
+        uses: docker/build-push-action@v6
+        with:
+          tags: |
+            ${{ matrix.nginx-tags-otel }}
+          context: nginx
+          cache-from: type=registry,ref=ghcr.io/heycart/docker-cache:${{ matrix.php }}-nginx-otel
+          cache-to: type=registry,ref=ghcr.io/heycart/docker-cache:${{ matrix.php }}-nginx-otel,mode=max
+          platforms: linux/amd64,linux/arm64
+          build-args: |
+            FPM_IMAGE=${{ matrix.fpm-image }}-otel
+          push: true
+          provenance: false
+
+  check:
+    name: Test Image with Webserver ${{ matrix.webserver }}
+    runs-on: ubuntu-latest
+    needs: [caddy, nginx]
+    strategy:
+      matrix:
+        webserver:
+          - caddy
+          - nginx
+    steps:
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Checkout example repo
+        uses: actions/checkout@v4
+        with:
+          repository: heycartLabs/example-docker-repository
+
+      - name: Build main branch
+        if: github.ref == 'refs/heads/main'
+        run: docker compose build --build-arg BASE_IMAGE=ghcr.io/heycart/docker-base:8.3-caddy
+        env:
+          DOCKER_BUILDKIT: 0
+
+      - name: Build PR
+        if: github.ref != 'refs/heads/main'
+        run: docker compose build --build-arg BASE_IMAGE=ghcr.io/heycart/docker-base-ci-test:${{ github.run_id }}-8.3-${{ matrix.webserver}}
+        env:
+          DOCKER_BUILDKIT: 0
+
+      - name: Run image
+        env:
+          DOCKER_BUILDKIT: 0
+        run: docker compose up -d --wait
+
+      - name: Wait for Webserver reachable
+        run: |
+          attempt_counter=0
+          max_attempts=5
+
+          until $(curl --output /dev/null --silent --head --fail localhost:8000/admin); do
+              if [ ${attempt_counter} -eq ${max_attempts} ];then
+                echo "Max attempts reached"
+                exit 1
+              fi
+
+              printf '.'
+              attempt_counter=$(($attempt_counter+1))
+              sleep 5
+          done
+
+      - name: Check if heycart admin is running
+        run: curl --fail localhost:8000/admin
+
+      - name: Check if heycart is running
+        run: curl --fail localhost:8000
+
+      # output logs if failed
+      - name: Output logs
+        run: docker compose logs
+        if: ${{ always() }}

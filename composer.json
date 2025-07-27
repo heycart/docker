@@ -1,0 +1,10 @@
+{
+  "name": "heycart/docker",
+  "type": "metapackage",
+  "license": "MIT",
+  "description": "Docker image for HeyCart 6 production",
+  "require": {
+    "heycart/core": ">=6.7.0.0",
+    "heycart/deployment-helper": "*"
+  }
+}
