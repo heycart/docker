@@ -1,3 +1,3 @@
-# HeyCart 6 Production Docker
+# HeyCart 6 Production Docker 
 
 This repository contains a base image with Alpine + PHP + (Caddy or Nginx), which you can use to build your docker image with your code.
